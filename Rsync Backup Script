@@ -1,0 +1,106 @@
+#!/bin/bash
+
+# Variables
+REMOTE_USER="SSH-USERNAME" #Your ssh username
+REMOTE_HOST="HOST-IP" #Your Host IP address
+SITE_NAME="SITE-NAME"
+REMOTE_WEB_DIR="DIRECTORY-TO-BE-ZIPPED" # i.e. /path/to/sitedirectory this is the whole directory on the remote server that will be zipped!
+REMOTE_DB="DB-NAME" #DB Name, this is the DB that we will create a dump of and that the script downloads
+LOCAL_BACKUP_BASE_DIR="BASE-LOCAL-DIR" #this is the base local directory where the ${TRUE_BACKUP_DIR} is created, your files are stored within the ${TRUE_BACKUP_DIR}
+REMOTE_BACKUP_DIR="BASE-REMOTE-DIR" #i.e. /remote/backup/path this is the directory on the remote server where your .zip file and the .sql db dump file will be stored
+DATE=$(date +'%Y-%m-%d') #Date 
+TRUE_BACKUP_DIR="${LOCAL_BACKUP_BASE_DIR}/SITE_BACKUP_${DATE}" #this is the directory that is made by the script where your files will be stored
+SSH_PASS="SSH-PASSWORD" #ssh password
+DB_USERNAME="DB-USERNAME" #DB Username
+DB_PASS="DB-PASSWORD" #DB Password
+SSH_PORT=22 #ssh port number
+LOG_FILE="${LOCAL_BACKUP_BASE_DIR}/backup_log_${DATE}.log" #Log file created by script that logs actions and errors
+SSH_OPTIONS="-o StrictHostKeyChecking=no -p ${SSH_PORT} -o ServerAliveInterval=60 -o ServerAliveCountMax=120" #Any specific ssh options you want to specify
+TAR_GZ_PATH="${REMOTE_BACKUP_DIR}/${SITE_NAME}_${DATE}.tar.gz" #The path of the tar.gz archive of the ${REMOTE_WEB_DIR}
+DB_DUMP_PATH="${REMOTE_BACKUP_DIR}/${REMOTE_DB}_backup_${DATE}.sql" #The path of the dump of the ${REMOTE_DB}
+CHECKSUM_FILE_PATH="${REMOTE_BACKUP_DIR}/checksum-$DATE.sha256" #Path of the Checksum file
+
+# Function to log messages
+log_message() {
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a ${LOG_FILE}
+}
+
+# Create a new directory for the backup
+log_message "Creating backup directory ${TRUE_BACKUP_DIR}"
+mkdir -p ${TRUE_BACKUP_DIR}
+if [ $? -ne 0 ]; then
+    log_message "Failed to create backup directory ${TRUE_BACKUP_DIR}"
+    exit 1
+fi
+
+# SSH into the remote server and tar/gzip the website folder
+log_message "Compressing the website folder on the remote server using tar/gzip"
+sshpass -p "${SSH_PASS}" ssh ${SSH_OPTIONS} ${REMOTE_USER}@${REMOTE_HOST} "tar -czf ${TAR_GZ_PATH} -C $(dirname ${REMOTE_WEB_DIR}) $(basename ${REMOTE_WEB_DIR})" &
+TAR_GZ_PID=$!
+
+wait $TAR_GZ_PID
+if [ $? -ne 0 ]; then
+    log_message "Failed to compress the website folder on the remote server"
+    exit 1
+fi
+
+# Download the tar.gz archive via rsync
+log_message "Downloading the compressed website archive using rsync"
+sshpass -p "${SSH_PASS}" rsync -avz -e "ssh -p ${SSH_PORT}" ${REMOTE_USER}@${REMOTE_HOST}:${TAR_GZ_PATH} ${TRUE_BACKUP_DIR}/
+if [ $? -ne 0 ]; then
+    log_message "Failed to download the compressed website archive"
+    exit 1
+fi
+
+# SSH into the remote server and create database dumps
+log_message "Creating database dump for ${REMOTE_DB}"
+sshpass -p "${SSH_PASS}" ssh ${SSH_OPTIONS} ${REMOTE_USER}@${REMOTE_HOST} "mysqldump -u ${DB_USERNAME} -p'${DB_PASS}' ${REMOTE_DB} > ${DB_DUMP_PATH}" &
+DUMP_DB1_PID=$!
+
+wait $DUMP_DB1_PID
+if [ $? -ne 0 ]; then
+    log_message "Database dump for ${REMOTE_DB} failed"
+    exit 1
+fi
+
+# Download the database dumps via rsync
+log_message "Downloading the database dump for ${REMOTE_DB} using rsync"
+sshpass -p "${SSH_PASS}" rsync -avz -e "ssh -p ${SSH_PORT}" ${REMOTE_USER}@${REMOTE_HOST}:${DB_DUMP_PATH} ${TRUE_BACKUP_DIR}/
+if [ $? -ne 0 ]; then
+    log_message "Failed to download the database dump for ${REMOTE_DB}"
+    exit 1
+fi
+
+# Generate Checksums of the tar.gz File and the Dump
+log_message "Generating checksum for the backup files"
+sshpass -p "${SSH_PASS}" ssh ${SSH_OPTIONS} ${REMOTE_USER}@${REMOTE_HOST} "cd ${REMOTE_BACKUP_DIR} && sha256sum $(basename ${TAR_GZ_PATH}) $(basename ${DB_DUMP_PATH}) > $(basename ${CHECKSUM_FILE_PATH})" &
+CHECK_PID=$!
+
+wait $CHECK_PID
+if [ $? -ne 0 ]; then
+    log_message "Failed to generate checksum"
+    exit 1
+fi
+
+log_message "Downloading the checksum file using rsync"
+sshpass -p "${SSH_PASS}" rsync -avz -e "ssh -p ${SSH_PORT}" ${REMOTE_USER}@${REMOTE_HOST}:${CHECKSUM_FILE_PATH} ${TRUE_BACKUP_DIR}/
+if [ $? -ne 0 ]; then
+    log_message "Failed to download the checksum file"
+    exit 1
+fi
+
+cd ${TRUE_BACKUP_DIR}
+log_message "Verifying checksum"
+sha256sum -c $(basename ${CHECKSUM_FILE_PATH})
+if [ $? -eq 0 ]; then
+    log_message "Checksum verification succeeded"
+
+    # Optional: Remove the backups from the remote server
+    log_message "Removing the backups from the remote server"
+    sshpass -p "${SSH_PASS}" ssh ${SSH_OPTIONS} ${REMOTE_USER}@${REMOTE_HOST} "rm ${TAR_GZ_PATH} ${DB_DUMP_PATH} ${CHECKSUM_FILE_PATH}"
+
+    log_message "Backup completed and stored in ${TRUE_BACKUP_DIR} on $(date)"
+else
+    log_message "Checksum verification failed. Please check the files."
+    exit 1
+fi
