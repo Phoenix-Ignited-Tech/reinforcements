@@ -1,0 +1,1 @@
+Reinforcements is a collection of backup scripts for quicker and secure backup management. They are extremely simple and best for scenarios where you would otherwise need to manually perform backups via the Linux CLI and SSH.
